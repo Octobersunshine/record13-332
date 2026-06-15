@@ -1,8 +1,13 @@
 import re
 import json
+import multiprocessing
+import queue
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
+
+DEFAULT_TIMEOUT = 3
+MAX_TEXT_LENGTH = 100000
 
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -65,6 +70,10 @@ HTML_TEMPLATE = r"""
                     <option value="finditer">finditer (迭代器模式)</option>
                 </select>
             </div>
+            <div class="form-group">
+                <label for="timeout">超时时间（秒，0.5-10）</label>
+                <input type="number" id="timeout" name="timeout" value="3" min="0.5" max="10" step="0.5">
+            </div>
             <button type="submit">测试匹配</button>
         </form>
         
@@ -82,7 +91,8 @@ HTML_TEMPLATE = r"""
                 pattern: formData.get('pattern'),
                 test_text: formData.get('test_text'),
                 flags: flags,
-                method: formData.get('method')
+                method: formData.get('method'),
+                timeout: parseFloat(formData.get('timeout')) || 3
             };
             
             try {
@@ -173,6 +183,61 @@ HTML_TEMPLATE = r"""
 </html>
 """
 
+def _regex_worker(pattern, test_text, flags, method, result_queue):
+    try:
+        compiled = re.compile(pattern, flags)
+        matches = []
+
+        if method in ('findall', 'finditer'):
+            for m in compiled.finditer(test_text):
+                matches.append(format_match(m))
+        elif method == 'search':
+            m = compiled.search(test_text)
+            if m:
+                matches.append(format_match(m))
+        elif method == 'match':
+            m = compiled.match(test_text)
+            if m:
+                matches.append(format_match(m))
+        elif method == 'fullmatch':
+            m = compiled.fullmatch(test_text)
+            if m:
+                matches.append(format_match(m))
+        else:
+            result_queue.put({'error': f'不支持的方法: {method}'})
+            return
+
+        result_queue.put({'success': True, 'matches': matches})
+    except re.error as e:
+        result_queue.put({'error': f'正则表达式语法错误: {str(e)}'})
+    except Exception as e:
+        result_queue.put({'error': f'匹配异常: {str(e)}'})
+
+
+def run_regex_with_timeout(pattern, test_text, flags, method, timeout=DEFAULT_TIMEOUT):
+    ctx = multiprocessing.get_context('spawn')
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_regex_worker,
+        args=(pattern, test_text, flags, method, result_queue)
+    )
+    proc.start()
+    proc.join(timeout)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(1)
+        if proc.is_alive():
+            proc.kill()
+        return {'error': f'正则匹配超时（超过 {timeout} 秒），可能存在灾难性回溯，已强制终止'}
+
+    try:
+        result = result_queue.get_nowait()
+        return result
+    except queue.Empty:
+        return {'error': '正则匹配未返回结果'}
+
+
 def parse_flags(flags_list):
     flags = 0
     flag_map = {
@@ -208,47 +273,34 @@ def index():
 def test_regex():
     try:
         data = request.get_json()
-        
+
         pattern = data.get('pattern', '')
         test_text = data.get('test_text', '')
         flags_list = data.get('flags', [])
         method = data.get('method', 'findall')
-        
+        timeout = min(max(float(data.get('timeout', DEFAULT_TIMEOUT)), 0.5), 10)
+
         if not pattern:
             return jsonify({'error': '正则表达式不能为空'}), 400
         if not test_text:
             return jsonify({'error': '测试文本不能为空'}), 400
-        
+        if len(test_text) > MAX_TEXT_LENGTH:
+            return jsonify({'error': f'测试文本过长（超过 {MAX_TEXT_LENGTH} 字符）'}), 400
+
         flags = parse_flags(flags_list)
-        
+
         try:
-            compiled = re.compile(pattern, flags)
+            re.compile(pattern, flags)
         except re.error as e:
             return jsonify({'error': f'正则表达式语法错误: {str(e)}'}), 400
-        
-        matches = []
-        
-        if method == 'findall':
-            for m in compiled.finditer(test_text):
-                matches.append(format_match(m))
-        elif method == 'finditer':
-            for m in compiled.finditer(test_text):
-                matches.append(format_match(m))
-        elif method == 'search':
-            m = compiled.search(test_text)
-            if m:
-                matches.append(format_match(m))
-        elif method == 'match':
-            m = compiled.match(test_text)
-            if m:
-                matches.append(format_match(m))
-        elif method == 'fullmatch':
-            m = compiled.fullmatch(test_text)
-            if m:
-                matches.append(format_match(m))
-        else:
-            return jsonify({'error': f'不支持的方法: {method}'}), 400
-        
+
+        result = run_regex_with_timeout(pattern, test_text, flags, method, timeout)
+
+        if 'error' in result:
+            return jsonify({'error': result['error']}), 400
+
+        matches = result.get('matches', [])
+
         return jsonify({
             'success': True,
             'pattern': pattern,
@@ -256,9 +308,12 @@ def test_regex():
             'flags': flags_list,
             'test_text': test_text,
             'match_count': len(matches),
-            'matches': matches
+            'matches': matches,
+            'timeout_seconds': timeout
         })
-        
+
+    except ValueError as e:
+        return jsonify({'error': f'参数错误: {str(e)}'}), 400
     except Exception as e:
         return jsonify({'error': f'服务器错误: {str(e)}'}), 500
 
