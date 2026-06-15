@@ -9,6 +9,69 @@ app = Flask(__name__)
 DEFAULT_TIMEOUT = 3
 MAX_TEXT_LENGTH = 100000
 
+REGEX_TEMPLATES = [
+    {
+        'name': '邮箱地址',
+        'pattern': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+        'description': '匹配常见邮箱地址格式',
+        'example': 'test@example.com, user.name@domain.org'
+    },
+    {
+        'name': '手机号码（中国）',
+        'pattern': r'1[3-9]\d{9}',
+        'description': '匹配中国大陆 11 位手机号码',
+        'example': '13812345678, 15987654321'
+    },
+    {
+        'name': 'URL 地址',
+        'pattern': r'https?://[a-zA-Z0-9.-]+(?:/[a-zA-Z0-9._~:/?#@!$&\'()*+,;=-]*)?',
+        'description': '匹配 HTTP/HTTPS URL 地址',
+        'example': 'https://www.example.com/path?query=1'
+    },
+    {
+        'name': 'IPv4 地址',
+        'pattern': r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
+        'description': '匹配标准 IPv4 地址',
+        'example': '192.168.1.1, 10.0.0.255'
+    },
+    {
+        'name': '身份证号（中国）',
+        'pattern': r'[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]',
+        'description': '匹配 18 位中国居民身份证号',
+        'example': '110101199003077758'
+    },
+    {
+        'name': '日期（YYYY-MM-DD）',
+        'pattern': r'\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])',
+        'description': '匹配 YYYY-MM-DD 格式日期',
+        'example': '2024-01-15, 2025-12-31'
+    },
+    {
+        'name': '中文字符',
+        'pattern': r'[\u4e00-\u9fa5]+',
+        'description': '匹配连续的中文字符',
+        'example': '你好世界，正则表达式测试'
+    },
+    {
+        'name': '整数',
+        'pattern': r'-?\d+',
+        'description': '匹配正负整数',
+        'example': '123, -456, 0'
+    },
+    {
+        'name': '浮点数',
+        'pattern': r'-?\d+\.\d+',
+        'description': '匹配正负浮点数',
+        'example': '3.14, -0.5, 100.0'
+    },
+    {
+        'name': '十六进制颜色',
+        'pattern': r'#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\b',
+        'description': '匹配 CSS 十六进制颜色值',
+        'example': '#fff, #ff5500, #123abc'
+    }
+]
+
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -36,12 +99,25 @@ HTML_TEMPLATE = r"""
         .error { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 4px; border-left: 4px solid #dc3545; }
         .highlight { background: #ffeeba; }
         pre { background: #f8f9fa; padding: 15px; border-radius: 4px; overflow-x: auto; margin-top: 10px; }
+        .template-section { margin-bottom: 20px; }
+        .template-desc { font-size: 12px; color: #666; margin-top: 5px; font-style: italic; }
+        .template-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .template-header label { margin-bottom: 0; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>正则表达式测试工具</h1>
         <form id="regexForm">
+            <div class="form-group template-section">
+                <div class="template-header">
+                    <label for="template">常用正则模板</label>
+                </div>
+                <select id="template" name="template">
+                    <option value="">-- 选择模板 --</option>
+                </select>
+                <div class="template-desc" id="template-desc"></div>
+            </div>
             <div class="form-group">
                 <label for="pattern">正则表达式</label>
                 <input type="text" id="pattern" name="pattern" placeholder="例如: \d+ 或 ([a-z]+)" required>
@@ -81,6 +157,46 @@ HTML_TEMPLATE = r"""
     </div>
 
     <script>
+        let templates = [];
+        
+        async function loadTemplates() {
+            try {
+                const response = await fetch('/api/templates');
+                const data = await response.json();
+                if (data.success) {
+                    templates = data.templates;
+                    const select = document.getElementById('template');
+                    templates.forEach((tpl, idx) => {
+                        const option = document.createElement('option');
+                        option.value = idx;
+                        option.textContent = tpl.name;
+                        select.appendChild(option);
+                    });
+                }
+            } catch (error) {
+                console.error('加载模板失败:', error);
+            }
+        }
+        
+        document.getElementById('template').addEventListener('change', function(e) {
+            const idx = parseInt(e.target.value);
+            const descEl = document.getElementById('template-desc');
+            
+            if (isNaN(idx) || idx < 0 || idx >= templates.length) {
+                descEl.textContent = '';
+                return;
+            }
+            
+            const tpl = templates[idx];
+            document.getElementById('pattern').value = tpl.pattern;
+            if (tpl.example) {
+                document.getElementById('test_text').value = tpl.example;
+            }
+            descEl.textContent = tpl.description || '';
+        });
+        
+        loadTemplates();
+        
         document.getElementById('regexForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             const formData = new FormData(this);
@@ -268,6 +384,13 @@ def format_match(match_obj):
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/templates')
+def get_templates():
+    return jsonify({
+        'success': True,
+        'templates': REGEX_TEMPLATES
+    })
 
 @app.route('/api/test', methods=['POST'])
 def test_regex():
